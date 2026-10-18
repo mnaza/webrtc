@@ -16,14 +16,34 @@ use rtc::shared::tcp_framing::{TcpFrameDecoder, frame_packet};
 use rtc::shared::turn_framing::TurnStreamDecoder;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
 const TCP_READ_BUF_LEN: usize = 4096;
+
+/// How many bytes may wait for one TCP stream before it is treated as lost.
+///
+/// A write to a black-holed connection — a network handover, a middlebox that stopped
+/// forwarding — fills the kernel's send buffer and then waits for room that never comes, for
+/// as long as the kernel keeps retransmitting. Awaiting that in the driver stops reads,
+/// timers and `close()` with it, so the driver hands the bytes over and walks away. What it
+/// cannot do is hold them for ever: past this much unsent data the connection is no longer
+/// carrying anything, and saying so lets ICE fail over to another candidate pair.
+const MAX_PENDING_WRITE_BYTES: usize = 256 * 1024;
+
+/// A finished write: which stream, and how it went.
+pub(crate) type TcpWriteResult = (FourTuple, io::Result<()>);
+
+/// Bytes waiting for one stream, and whether a write of them is already in flight. One at a
+/// time, so what goes out keeps the order it was written in.
+#[derive(Default)]
+struct PendingWrites {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    in_flight: bool,
+}
 
 pub(crate) type TcpAcceptResult = (
     SocketAddr,
@@ -48,8 +68,20 @@ pub(crate) struct RTCTcpTransport {
     /// TURN connections that are gone: a write to one is an error, never a silent
     /// drop and never a fallback onto some other stream.
     dead_turn_streams: HashSet<FourTuple>,
+    /// Unsent bytes per stream, and the write in flight for it.
+    pending_writes: HashMap<FourTuple, PendingWrites>,
+    /// Streams the relayer has let go of that are still emptying their queue: the last thing
+    /// on it is the Refresh(LIFETIME=0) that releases the allocation.
+    draining: HashSet<FourTuple>,
     pub(crate) accept_futures: FuturesUnordered<BoxFuture<'static, TcpAcceptResult>>,
     pub(crate) read_futures: FuturesUnordered<BoxFuture<'static, TcpReadResult>>,
+    pub(crate) write_futures: FuturesUnordered<BoxFuture<'static, TcpWriteResult>>,
+}
+
+impl PendingWrites {
+    fn is_busy(&self) -> bool {
+        self.in_flight || !self.chunks.is_empty()
+    }
 }
 
 impl RTCTcpTransport {
@@ -75,8 +107,11 @@ impl RTCTcpTransport {
             decoders: HashMap::new(),
             closed_turn_streams: Vec::new(),
             dead_turn_streams: HashSet::new(),
+            pending_writes: HashMap::new(),
+            draining: HashSet::new(),
             accept_futures,
             read_futures: FuturesUnordered::new(),
+            write_futures: FuturesUnordered::new(),
         }
     }
 
@@ -99,22 +134,25 @@ impl RTCTcpTransport {
     /// The stream for a four-tuple: the exact one, or for ICE-TCP any stream to the same
     /// peer. The fallback never picks a TURN connection — its bytes are framed differently,
     /// and ICE traffic has no business on it.
-    fn find_stream(&self, four_tuple: &FourTuple) -> Option<Arc<dyn AsyncTcpStream>> {
-        self.streams.get(four_tuple).cloned().or_else(|| {
-            self.streams
-                .iter()
-                .find(|(tuple, stream)| {
-                    !self.is_turn_stream(tuple)
-                        && stream
-                            .peer_addr()
-                            .is_ok_and(|peer| peer == four_tuple.peer_addr)
-                })
-                .map(|(_, stream)| stream.clone())
-        })
+    fn find_stream(&self, four_tuple: &FourTuple) -> Option<FourTuple> {
+        if self.streams.contains_key(four_tuple) {
+            return Some(*four_tuple);
+        }
+        self.streams
+            .iter()
+            .find(|(tuple, stream)| {
+                !self.is_turn_stream(tuple)
+                    && stream
+                        .peer_addr()
+                        .is_ok_and(|peer| peer == four_tuple.peer_addr)
+            })
+            .map(|(tuple, _)| *tuple)
     }
 
     fn remove_stream(&mut self, four_tuple: &FourTuple) {
         self.streams.remove(four_tuple);
+        self.pending_writes.remove(four_tuple);
+        self.draining.remove(four_tuple);
         if let Some(StreamDecoder::Turn(_)) = self.decoders.remove(four_tuple) {
             self.closed_turn_streams.push(*four_tuple);
             self.dead_turn_streams.insert(*four_tuple);
@@ -125,10 +163,28 @@ impl RTCTcpTransport {
     /// reported back — the relayer asked for it.
     pub(crate) fn release_turn_stream(&mut self, four_tuple: &FourTuple) {
         if self.is_turn_stream(four_tuple) {
-            self.streams.remove(four_tuple);
             self.decoders.remove(four_tuple);
             self.dead_turn_streams.insert(*four_tuple);
+            // The release itself may still be queued. Hold the stream open until it has
+            // gone out; `on_write` drops it then.
+            if self.has_pending_writes_for(four_tuple) {
+                self.draining.insert(*four_tuple);
+            } else {
+                self.streams.remove(four_tuple);
+                self.pending_writes.remove(four_tuple);
+            }
         }
+    }
+
+    /// Whether any stream has bytes still to go out.
+    pub(crate) fn has_pending_writes(&self) -> bool {
+        self.pending_writes.values().any(PendingWrites::is_busy)
+    }
+
+    fn has_pending_writes_for(&self, four_tuple: &FourTuple) -> bool {
+        self.pending_writes
+            .get(four_tuple)
+            .is_some_and(PendingWrites::is_busy)
     }
 
     /// TURN connections that have ended since the last call. The relayer drops the
@@ -137,36 +193,93 @@ impl RTCTcpTransport {
         std::mem::take(&mut self.closed_turn_streams)
     }
 
-    pub(crate) fn write<'a>(
-        &self,
-        msg: &'a TaggedBytesMut,
-    ) -> Pin<Box<dyn Future<Output = Result<usize>> + Send + 'a>> {
+    /// Hand a packet to its stream. It is queued rather than written: a stream the far end
+    /// has stopped reading would otherwise hold the driver for as long as the kernel keeps
+    /// trying. The write itself completes through [`write_futures`](Self::write_futures) and
+    /// [`on_write`](Self::on_write).
+    pub(crate) fn write(&mut self, msg: &TaggedBytesMut) -> Result<usize> {
         let four_tuple = FourTuple::from(&msg.transport);
         if self.dead_turn_streams.contains(&four_tuple) {
-            return Box::pin(async move {
-                Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    format!("TURN connection {four_tuple:?} has closed"),
-                )
-                .into())
-            });
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                format!("TURN connection {four_tuple:?} has closed"),
+            )
+            .into());
         }
-        let Some(stream) = self.find_stream(&four_tuple) else {
+        let Some(key) = self.find_stream(&four_tuple) else {
             trace!("No TCP stream found for {:?}", four_tuple);
-            return Box::pin(async { Ok(0) });
+            return Ok(0);
         };
 
         // TURN messages delimit themselves; only ICE-TCP gets a length prefix.
-        let framed = if self.is_turn_stream(&four_tuple) {
+        let framed = if self.is_turn_stream(&key) {
             msg.message.to_vec()
         } else {
             frame_packet(&msg.message)
         };
         let len = msg.message.len();
-        Box::pin(async move {
-            stream.write_all(&framed).await?;
-            Ok(len)
-        })
+        let pending = self.pending_writes.entry(key).or_default();
+        if pending.bytes + framed.len() > MAX_PENDING_WRITE_BYTES {
+            let waiting = pending.bytes;
+            error!(
+                "TCP stream {:?} has {} bytes that will not go out; treating it as lost",
+                key, waiting
+            );
+            self.remove_stream(&key);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("TCP stream {key:?} is not draining"),
+            )
+            .into());
+        }
+        pending.bytes += framed.len();
+        pending.chunks.push_back(framed);
+        self.arm_write(key);
+        Ok(len)
+    }
+
+    /// Start the next queued write for a stream, if one is not already under way.
+    fn arm_write(&mut self, four_tuple: FourTuple) {
+        let Some(stream) = self.streams.get(&four_tuple).cloned() else {
+            return;
+        };
+        let Some(pending) = self.pending_writes.get_mut(&four_tuple) else {
+            return;
+        };
+        if pending.in_flight {
+            return;
+        }
+        let Some(chunk) = pending.chunks.pop_front() else {
+            return;
+        };
+        pending.bytes -= chunk.len();
+        pending.in_flight = true;
+        self.write_futures.push(
+            async move {
+                let res = stream.write_all(&chunk).await;
+                (four_tuple, res)
+            }
+            .boxed(),
+        );
+    }
+
+    /// A write that finished. The next queued one goes out; a failed one ends the stream.
+    pub(crate) fn on_write(&mut self, (four_tuple, res): TcpWriteResult) {
+        if let Some(pending) = self.pending_writes.get_mut(&four_tuple) {
+            pending.in_flight = false;
+        }
+        if let Err(err) = res {
+            error!("TCP write to {:?} failed: {}", four_tuple, err);
+            self.remove_stream(&four_tuple);
+            return;
+        }
+        self.arm_write(four_tuple);
+        // A stream kept open only to let its release out has nothing more to carry.
+        if self.draining.contains(&four_tuple) && !self.has_pending_writes_for(&four_tuple) {
+            self.streams.remove(&four_tuple);
+            self.pending_writes.remove(&four_tuple);
+            self.draining.remove(&four_tuple);
+        }
     }
 
     fn arm_accept(&mut self, local_addr: SocketAddr) {
@@ -232,6 +345,8 @@ impl RTCTcpTransport {
         decoder: StreamDecoder,
     ) {
         self.dead_turn_streams.remove(&four_tuple);
+        self.pending_writes.remove(&four_tuple);
+        self.draining.remove(&four_tuple);
         self.streams.insert(four_tuple, stream.clone());
         self.decoders.insert(four_tuple, decoder);
         self.arm_read(four_tuple, stream);
@@ -430,6 +545,8 @@ mod tests {
     use super::*;
     use crate::runtime::default_runtime;
     use futures::StreamExt;
+    use std::future::Future;
+    use std::pin::Pin;
 
     /// Drive a future on the default runtime, returning its output.
     fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -497,6 +614,107 @@ mod tests {
         0x01, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
     ];
 
+    /// A peer that accepts the connection and never reads: `write_all` waits for the kernel
+    /// to make room, which on a black-holed connection is minutes, and the driver waits with
+    /// it — no reads, no timers, no close. The bytes are queued instead, and a stream that
+    /// lets the queue fill is treated as lost so ICE can fail over.
+    #[derive(Debug)]
+    struct StalledStream(FourTuple);
+
+    impl AsyncTcpStream for StalledStream {
+        fn read<'a, 'b>(
+            &'a self,
+            _buf: &'b mut [u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<usize>> + Send + 'b>>
+        where
+            'a: 'b,
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn write_all<'a, 'b>(
+            &'a self,
+            _buf: &'b [u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'b>>
+        where
+            'a: 'b,
+        {
+            Box::pin(std::future::pending())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.0.local_addr)
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.0.peer_addr)
+        }
+    }
+
+    /// Drive queued writes onto the wire, as the driver's event loop does.
+    async fn flush(transport: &mut RTCTcpTransport) {
+        while transport.has_pending_writes() {
+            let res = transport
+                .write_futures
+                .next()
+                .await
+                .expect("a write in flight");
+            transport.on_write(res);
+        }
+    }
+
+    #[test]
+    fn a_stream_that_never_drains_is_lost_rather_than_blocking_the_driver() {
+        block_on(async {
+            let four_tuple = FourTuple {
+                local_addr: "127.0.0.1:40001".parse().unwrap(),
+                peer_addr: "127.0.0.1:3478".parse().unwrap(),
+            };
+            let mut transport = RTCTcpTransport::new(HashMap::new());
+            transport.register_turn_stream(four_tuple, Arc::new(StalledStream(four_tuple)));
+
+            let msg = outgoing(four_tuple, &[0u8; 1024]);
+            let mut queued = 0usize;
+            while let Ok(n) = transport.write(&msg) {
+                queued += n;
+                assert!(
+                    queued <= 2 * MAX_PENDING_WRITE_BYTES,
+                    "a stream that never drains must not be queued for without end"
+                );
+            }
+            assert_eq!(
+                transport.take_closed_turn_streams(),
+                vec![four_tuple],
+                "the relayer has to hear that this connection is no use"
+            );
+            assert!(
+                transport.write(&msg).is_err(),
+                "nothing more goes out on it"
+            );
+        });
+    }
+
+    #[test]
+    fn queued_writes_reach_the_stream_in_the_order_they_were_made() {
+        block_on(async {
+            let (ours, four_tuple, theirs) = connected_pair().await;
+            let mut transport = RTCTcpTransport::new(HashMap::new());
+            transport.register_turn_stream(four_tuple, ours);
+
+            transport.write(&outgoing(four_tuple, &STUN)).unwrap();
+            transport
+                .write(&outgoing(four_tuple, &CHANNEL_DATA))
+                .unwrap();
+            flush(&mut transport).await;
+
+            assert_eq!(
+                read_exactly(&theirs, STUN.len() + CHANNEL_DATA.len()).await,
+                [STUN.as_slice(), CHANNEL_DATA.as_slice()].concat(),
+                "one stream, one order"
+            );
+        });
+    }
+
     #[test]
     fn a_turn_stream_carries_messages_without_a_length_prefix() {
         block_on(async {
@@ -506,9 +724,9 @@ mod tests {
 
             let written = transport
                 .write(&outgoing(four_tuple, &CHANNEL_DATA))
-                .await
                 .unwrap();
             assert_eq!(written, CHANNEL_DATA.len());
+            flush(&mut transport).await;
             assert_eq!(
                 read_exactly(&theirs, CHANNEL_DATA.len()).await,
                 CHANNEL_DATA,
@@ -541,7 +759,8 @@ mod tests {
             let (ours, four_tuple, theirs) = connected_pair().await;
             let mut transport = RTCTcpTransport::new(HashMap::new());
             transport.register_stream(four_tuple, ours);
-            transport.write(&outgoing(four_tuple, &STUN)).await.unwrap();
+            transport.write(&outgoing(four_tuple, &STUN)).unwrap();
+            flush(&mut transport).await;
             let got = read_exactly(&theirs, 2 + STUN.len()).await;
             assert_eq!(&got[..2], &(STUN.len() as u16).to_be_bytes());
             assert_eq!(&got[2..], STUN);
@@ -565,7 +784,7 @@ mod tests {
                 "the relayer has to hear that its connection is gone"
             );
             assert!(
-                transport.write(&outgoing(four_tuple, &STUN)).await.is_err(),
+                transport.write(&outgoing(four_tuple, &STUN)).is_err(),
                 "a write to a dead TURN stream fails rather than vanishing"
             );
         });
@@ -598,7 +817,7 @@ mod tests {
             transport.release_turn_stream(&four_tuple);
             assert!(transport.take_closed_turn_streams().is_empty());
             assert!(
-                transport.write(&outgoing(four_tuple, &STUN)).await.is_err(),
+                transport.write(&outgoing(four_tuple, &STUN)).is_err(),
                 "nothing more goes out on it"
             );
         });
@@ -616,7 +835,7 @@ mod tests {
                 local_addr: "127.0.0.1:9".parse().unwrap(),
                 peer_addr: turn_tuple.peer_addr,
             };
-            let written = transport.write(&outgoing(stranger, &STUN)).await.unwrap();
+            let written = transport.write(&outgoing(stranger, &STUN)).unwrap();
             assert_eq!(written, 0, "nothing was sent");
             // Proving an absence: on loopback anything written arrives in microseconds, so
             // 200 ms of silence means nothing was written, not that it was slow.

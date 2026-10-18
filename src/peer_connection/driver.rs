@@ -20,7 +20,7 @@ use crate::rtp_transceiver::rtp_receiver::RtpReceiverImpl;
 use crate::rtp_transceiver::{RtpReceiver, RtpTransceiverImpl};
 use crate::runtime::{
     AsyncTcpStream, AsyncUdpSocket, EcnCodepoint, Receiver, RecvMeta, Sender, Transmit,
-    TrySendError, channel,
+    TrySendError, channel, timeout,
 };
 use bytes::BytesMut;
 use futures::FutureExt; // For .fuse() in futures::select!
@@ -119,6 +119,11 @@ const DEFAULT_TIMEOUT_DURATION: Duration = Duration::from_secs(86400); // 1 day 
 /// Gathering waits for it, so it is bounded well under what an application waits for
 /// gathering to complete.
 const TURN_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long `close()` gives queued TCP writes — the TURN allocation releases among them — to
+/// reach the wire. A stream that is not draining is what the queue exists to survive, so
+/// this is short: the allocations it could not release expire on their own lifetime.
+const TCP_CLOSE_FLUSH_BUDGET: Duration = Duration::from_millis(200);
 
 /// The resolution at which an already-expired deadline is worth re-handling.
 ///
@@ -959,6 +964,15 @@ where
             .into();
             futures::pin_mut!(tcp_read_future);
 
+            let tcp_write_future: OptionFuture<_> = if !self.tcp_transport.write_futures.is_empty()
+            {
+                Some(self.tcp_transport.write_futures.next())
+            } else {
+                None
+            }
+            .into();
+            futures::pin_mut!(tcp_write_future);
+
             // Runtime-agnostic select!
             futures::select! {
                 // A blocked consumer freed a slot: hand over what was retained, now.
@@ -1130,6 +1144,16 @@ where
                     }
                 }
 
+                // An outgoing TCP write finished: the next queued one goes out, and a
+                // stream that failed is dropped. Writes are never awaited inline — a
+                // connection the far end has stopped reading would hold the driver for as
+                // long as the kernel keeps retransmitting.
+                tcp_write_result = tcp_write_future => {
+                    if let Some(Some(res)) = tcp_write_result {
+                        self.tcp_transport.on_write(res);
+                    }
+                }
+
                 // Incoming TCP frame data from any tcp stream
                 tcp_read_result = tcp_read_future => {
                     if let Some(Some(res) ) = tcp_read_result {
@@ -1147,7 +1171,7 @@ where
 
     async fn handle_write(&mut self, msg: TaggedBytesMut) -> Result<usize> {
         if msg.transport.transport_protocol == TransportProtocol::TCP {
-            self.tcp_transport.write(&msg).await
+            self.tcp_transport.write(&msg)
         } else if msg.transport.peer_addr.port() == MDNS_PORT {
             if let Some(socket) = &self.mdns_socket {
                 Ok(socket
@@ -1988,6 +2012,30 @@ where
         }
         if let Err(err) = self.poll_writes().await {
             error!("Failed to send TURN allocation releases: {}", err);
+        }
+        self.flush_tcp_writes().await;
+    }
+
+    /// Put queued TCP writes on the wire before the connection goes away — the releases
+    /// above are the last thing on those queues. Bounded: a stream that is not draining is
+    /// exactly what this queue exists to survive, and close waits for nobody.
+    async fn flush_tcp_writes(&mut self) {
+        let runtime = self.inner.runtime.clone();
+        let deadline = runtime.now() + TCP_CLOSE_FLUSH_BUDGET;
+        while self.tcp_transport.has_pending_writes() {
+            let left = deadline.saturating_duration_since(runtime.now());
+            if left.is_zero() {
+                warn!("TCP writes still queued at close; the connection goes away with them");
+                return;
+            }
+            match timeout(&*runtime, left, self.tcp_transport.write_futures.next()).await {
+                Ok(Some(res)) => self.tcp_transport.on_write(res),
+                Ok(None) => return,
+                Err(_) => {
+                    warn!("TCP writes still queued at close; the connection goes away with them");
+                    return;
+                }
+            }
         }
     }
 
