@@ -27,6 +27,17 @@ use std::time::{Duration, Instant};
 
 const MAX_PENDING_PACKETS_PER_PEER: usize = 64;
 
+/// How long gathering waits for an allocation over TCP before moving on without it.
+///
+/// A reliable transport has nothing to retransmit, so rtc-turn waits a transaction's whole
+/// 39.5s Ti (RFC 5389 §7.2.1) for an answer that may never come. Over UDP the schedule —
+/// 200ms doubling to a 1600ms cap, seven requests — abandons a silent server after 7.8s, and
+/// that is what a TURN URL costs gathering today, so a server reached over TCP is given the
+/// same. It bounds the allocation rather than each transaction: an unauthenticated Allocate
+/// answered with 401 starts a second one, which would otherwise double the wait. The client
+/// is kept either way — if the answer does arrive late, the relay candidate still goes out.
+const TCP_ALLOCATE_GATHERING_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Identifies a TCP connect across relayer instances: an ICE restart builds a new relayer,
 /// and a connect the old one asked for must not be mistaken for one the new one did.
 static NEXT_TCP_CONNECT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -71,6 +82,9 @@ struct ManagedTurnClient {
     local_addr: SocketAddr,
     relay_addr: Option<SocketAddr>,
     gather_finished: bool,
+    /// When gathering stops waiting for this client's allocation. Only TCP clients have one:
+    /// a UDP client's own retransmission schedule gives up on its own.
+    gather_deadline: Option<Instant>,
 }
 
 pub(crate) struct RTCTurnRelayer {
@@ -352,6 +366,7 @@ impl RTCTurnRelayer {
                 local_addr: four_tuple.local_addr,
                 relay_addr: None,
                 gather_finished: false,
+                gather_deadline: Some(self.runtime.now() + TCP_ALLOCATE_GATHERING_TIMEOUT),
             },
         );
         Ok(Some(four_tuple))
@@ -524,6 +539,7 @@ impl RTCTurnRelayer {
                             local_addr: *local_addr,
                             relay_addr: None,
                             gather_finished: false,
+                            gather_deadline: None,
                         },
                     );
                 }
@@ -1006,8 +1022,25 @@ impl Protocol<TaggedBytesMut, TaggedBytesMut, RTCTurnRelayEventIn> for RTCTurnRe
     }
 
     fn handle_timeout(&mut self, now: Self::Time) -> Result<()> {
+        let mut gave_up = false;
         for managed_client in self.clients.values_mut() {
             managed_client.client.handle_timeout(now)?;
+            if managed_client.gather_finished {
+                continue;
+            }
+            if managed_client.gather_deadline.is_some_and(|at| at <= now) {
+                warn!(
+                    "TURN allocation over TCP from {} via {} has not been answered in {:?}; \
+                     gathering moves on without it",
+                    managed_client.local_addr, managed_client.url, TCP_ALLOCATE_GATHERING_TIMEOUT
+                );
+                managed_client.gather_finished = true;
+                managed_client.gather_deadline = None;
+                gave_up = true;
+            }
+        }
+        if gave_up {
+            self.maybe_emit_gathering_complete();
         }
         Ok(())
     }
@@ -1017,6 +1050,11 @@ impl Protocol<TaggedBytesMut, TaggedBytesMut, RTCTurnRelayEventIn> for RTCTurnRe
         for managed_client in self.clients.values_mut() {
             if let Some(next) = managed_client.client.poll_timeout() {
                 eto = Some(eto.map_or(next, |current| std::cmp::min(current, next)));
+            }
+            if !managed_client.gather_finished
+                && let Some(deadline) = managed_client.gather_deadline
+            {
+                eto = Some(eto.map_or(deadline, |current| std::cmp::min(current, deadline)));
             }
         }
         eto
@@ -1441,6 +1479,89 @@ mod tests {
                 "an answer to a connect nobody is waiting for is not kept"
             );
             assert!(relayer.poll_write().is_none());
+        });
+    }
+
+    /// A server that accepts the connection and then says nothing held gathering for the
+    /// reliable transaction's whole 39.5s (RFC 5389 §7.2.1), where a silent UDP server costs
+    /// 7.8s. A captive proxy accepting every connection does exactly this, and a non-trickle
+    /// caller waiting for Complete waits with it.
+    #[test]
+    fn a_silent_tcp_server_does_not_hold_gathering_for_the_whole_transaction() {
+        futures::executor::block_on(async {
+            let mut relayer = tcp_relayer(&format!("turn:{}?transport=tcp", turn_server()));
+            relayer.gather().await.expect("gather");
+            let id = connect_id(&mut relayer);
+            relayer
+                .on_tcp_connected(id, Ok(tcp_tuple()))
+                .expect("a client over the connection");
+            relayer
+                .poll_write()
+                .expect("an Allocate over the connection");
+
+            let deadline = relayer.poll_timeout().expect("a deadline to give up on");
+            assert!(
+                deadline.saturating_duration_since(Instant::now()) <= Duration::from_secs(9),
+                "gathering must not wait a whole reliable transaction on one server"
+            );
+
+            relayer
+                .handle_timeout(deadline - Duration::from_millis(1))
+                .expect("handle_timeout");
+            assert!(
+                !events(&mut relayer)
+                    .iter()
+                    .any(|e| matches!(e, RTCTurnRelayEventOut::TurnGatheringComplete)),
+                "the allocation still has time"
+            );
+
+            relayer.handle_timeout(deadline).expect("handle_timeout");
+            assert!(
+                events(&mut relayer)
+                    .iter()
+                    .any(|e| matches!(e, RTCTurnRelayEventOut::TurnGatheringComplete)),
+                "gathering moves on without this server"
+            );
+            assert_eq!(relayer.state(), RTCIceGatheringState::Complete);
+            assert!(
+                relayer.take_released_tcp_streams().is_empty(),
+                "the client is kept: an answer that does arrive late is still a candidate"
+            );
+        });
+    }
+
+    /// The deadline bounds the allocation, not each transaction: a 401 starts a second,
+    /// authenticated Allocate with 39.5s of its own, and that is the doubling to avoid.
+    #[test]
+    fn a_401_does_not_extend_the_tcp_gathering_deadline() {
+        futures::executor::block_on(async {
+            let mut relayer = tcp_relayer(&format!("turn:{}?transport=tcp", turn_server()));
+            relayer.gather().await.expect("gather");
+            let id = connect_id(&mut relayer);
+            relayer
+                .on_tcp_connected(id, Ok(tcp_tuple()))
+                .expect("a client over the connection");
+            let anonymous = relayer.poll_write().expect("an anonymous Allocate");
+            let mut msg = StunMessage::new();
+            msg.raw = anonymous.message.to_vec();
+            msg.decode().expect("decode Allocate");
+            let deadline = relayer.poll_timeout().expect("a deadline to give up on");
+
+            let response = build_turn_allocate_unauthorized(msg.transaction_id);
+            let mut reply = tagged(tcp_tuple().local_addr, turn_server(), &response.raw);
+            reply.transport.transport_protocol = TransportProtocol::TCP;
+            relayer
+                .handle_read(reply)
+                .expect("the 401 is this client's");
+            relayer
+                .poll_write()
+                .expect("an authenticated Allocate follows it");
+
+            assert_eq!(
+                relayer.poll_timeout(),
+                Some(deadline),
+                "the retry must not buy another 39.5s"
+            );
         });
     }
 
